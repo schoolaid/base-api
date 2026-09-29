@@ -1,0 +1,6 @@
+*.exe
+*.exe~
+/conf
+/tests
+/app/config.go
+lastupdate.tmp
