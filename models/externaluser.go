@@ -4,11 +4,13 @@ import (
 	"github.com/beego/beego/v2/client/orm"
 )
 
+// ExternalUser is an integrator credential. The plain-text password is deliberately not mapped
+// (Notion 999, PR 5): only the token route reads it (MatchTokenLogin), so the contract step can
+// drop the column without breaking GetExternalUser.
 type ExternalUser struct {
 	Id         int64  `orm:"auto"`
 	Name      string `orm:"size(30)"`
 	Username   string `orm:"size(50)"`
-	Password  string `orm:"size(25)"`
 	Token   string `orm:"size(100)"`
 }
 
