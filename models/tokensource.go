@@ -1,6 +1,9 @@
 package models
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"net"
 	"net/http"
 	"os"
@@ -23,18 +26,7 @@ import (
 // for the connection it received; anything to its left came from the client and can say anything.
 // With no header (a call inside the network), the peer address. Telemetry only: it decides nothing.
 func ClassifyTokenSource(r *http.Request) string {
-	hop := ""
-	if values := r.Header.Values("X-Forwarded-For"); len(values) > 0 {
-		parts := strings.Split(values[len(values)-1], ",")
-		hop = strings.TrimSpace(parts[len(parts)-1])
-	}
-	if hop == "" {
-		hop = r.RemoteAddr
-		if host, _, err := net.SplitHostPort(hop); err == nil {
-			hop = host
-		}
-	}
-	ip := net.ParseIP(hop)
+	ip := tokenClientIP(r)
 	if ip == nil {
 		return "unknown"
 	}
@@ -47,6 +39,61 @@ func ClassifyTokenSource(r *http.Request) string {
 		return "vpc"
 	}
 	return "external"
+}
+
+// tokenClientIP is the address a load balancer in front saw: the rightmost hop of the last
+// X-Forwarded-For line (anything to its left came from the client), or the peer with no header.
+// nil if it doesn't parse.
+func tokenClientIP(r *http.Request) net.IP {
+	hop := ""
+	if values := r.Header.Values("X-Forwarded-For"); len(values) > 0 {
+		parts := strings.Split(values[len(values)-1], ",")
+		hop = strings.TrimSpace(parts[len(parts)-1])
+	}
+	if hop == "" {
+		hop = r.RemoteAddr
+		if host, _, err := net.SplitHostPort(hop); err == nil {
+			hop = host
+		}
+	}
+	return net.ParseIP(hop)
+}
+
+// TokenSourceTag is a pseudonymous tag of the login's source address, for counting how many users
+// one source mints: the first 8 hex characters of HMAC-SHA256(TOKEN_LOGIN_SRC_KEY, address). The
+// address is never logged, and without the key the tag can't be recomputed from a list of
+// addresses.
+//   - "unkeyed" when the key is missing or shorter than 16 characters: never a weak hash;
+//   - "unknown" when the address doesn't parse.
+//
+// Telemetry only: it decides nothing.
+func TokenSourceTag(r *http.Request) string {
+	ip := tokenClientIP(r)
+	if ip == nil {
+		return "unknown"
+	}
+	key := tokenSourceKey()
+	if key == nil {
+		return "unkeyed"
+	}
+	// ip.String() already writes a mapped IPv4 as plain IPv4, so both spellings tag alike.
+	m := hmac.New(sha256.New, key)
+	m.Write([]byte(ip.String()))
+	return hex.EncodeToString(m.Sum(nil))[:8]
+}
+
+var (
+	tokenSourceKeyOnce sync.Once
+	tokenSourceKeyVal  []byte
+)
+
+func tokenSourceKey() []byte {
+	tokenSourceKeyOnce.Do(func() {
+		if k := strings.TrimSpace(os.Getenv("TOKEN_LOGIN_SRC_KEY")); len(k) >= 16 {
+			tokenSourceKeyVal = []byte(k)
+		}
+	})
+	return tokenSourceKeyVal
 }
 
 type tokenSource struct {
@@ -91,8 +138,11 @@ func knownTokenSources() []tokenSource {
 	return tokenSources
 }
 
-// ResetTokenSourcesForTest makes the next login read TOKEN_LOGIN_KNOWN_SOURCES again.
+// ResetTokenSourcesForTest makes the next login read TOKEN_LOGIN_KNOWN_SOURCES and
+// TOKEN_LOGIN_SRC_KEY again.
 func ResetTokenSourcesForTest() {
 	tokenSourcesOnce = sync.Once{}
 	tokenSources = nil
+	tokenSourceKeyOnce = sync.Once{}
+	tokenSourceKeyVal = nil
 }
