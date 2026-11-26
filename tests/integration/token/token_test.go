@@ -371,3 +371,53 @@ func TestAMalformedKnownSourceIsIgnored(t *testing.T) {
 		t.Error("a good entry next to bad ones was dropped")
 	}
 }
+
+// qa-1 (P3): a request can carry X-Forwarded-For on more than one header line; the load balancer's
+// hop is the rightmost one of the LAST line.
+func TestTwoForwardedForLinesUseTheLastLinesRightmostHop(t *testing.T) {
+	t.Setenv("TOKEN_LOGIN_KNOWN_SOURCES", "nat=198.51.100.7")
+	models.ResetTokenSourcesForTest()
+	defer models.ResetTokenSourcesForTest()
+	id, user := credential(t, "Two-lines-pw", bcryptOf(t, "Two-lines-pw"))
+	form := url.Values{"username": {user}, "password": {"Two-lines-pw"}}
+	r := httptest.NewRequest("POST", "/token", strings.NewReader(form.Encode()))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	r.Header.Add("X-Forwarded-For", "198.51.100.7")
+	r.Header.Add("X-Forwarded-For", "192.0.2.10, 192.0.2.44")
+	r.RemoteAddr = "10.0.3.4:4431"
+	w := httptest.NewRecorder()
+	beego.BeeApp.Handlers.ServeHTTP(w, r)
+	if !logged(t, line(id, "exact", "yes")+" from=external\n") {
+		t.Error("the first X-Forwarded-For line (client-controlled) decided the source")
+	}
+}
+
+// qa-1 (P3): spaces around `=` or `,` are trimmed, so a hand-edited value doesn't silently lose a
+// source; an entry that is still malformed is ignored and logged by its position, never its value.
+func TestKnownSourcesTrimSpacesAndLogWhatTheyIgnore(t *testing.T) {
+	t.Setenv("TOKEN_LOGIN_KNOWN_SOURCES", " nat = 198.51.100.7 , old-box= 203.0.113.0/29,BAD LABEL=198.51.100.10, x=not-an-ip-203.0.113.250")
+	models.ResetTokenSourcesForTest()
+	defer models.ResetTokenSourcesForTest()
+	id, user := credential(t, "Trim-pw", bcryptOf(t, "Trim-pw"))
+	loginFrom(t, user, "Trim-pw", "198.51.100.7", "10.0.3.4:4431")
+	if !logged(t, line(id, "exact", "yes")+" from=nat\n") {
+		t.Error("a source with spaces around = was dropped")
+	}
+	id2, user2 := credential(t, "Trim-pw-2", bcryptOf(t, "Trim-pw-2"))
+	loginFrom(t, user2, "Trim-pw-2", "203.0.113.5", "10.0.3.4:4431")
+	if !logged(t, line(id2, "exact", "yes")+" from=old-box\n") {
+		t.Error("a source with a space after = was dropped")
+	}
+	for _, i := range []string{"3", "4"} {
+		if !logged(t, "TOKEN_LOGIN_KNOWN_SOURCES entry "+i+" ignored (malformed)") {
+			t.Errorf("malformed entry %s was dropped without a log line", i)
+		}
+	}
+	logs.GetBeeLogger().Flush()
+	b, _ := os.ReadFile(logFile)
+	for _, v := range []string{"BAD LABEL", "198.51.100.10", "not-an-ip-203.0.113.250"} {
+		if strings.Contains(string(b), v) {
+			t.Errorf("an ignored entry's value reached the log (%d chars)", len(v))
+		}
+	}
+}
