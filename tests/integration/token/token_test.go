@@ -28,6 +28,7 @@ import (
 	"github.com/beego/beego/v2/client/orm"
 	"github.com/beego/beego/v2/core/logs"
 	beego "github.com/beego/beego/v2/server/web"
+	"golang.org/x/crypto/bcrypt"
 )
 
 var logFile string
@@ -116,28 +117,64 @@ func logged(t *testing.T, line string) bool {
 
 func hashOf(s string) *string { return &s }
 
-func TestAnExactPasswordLogsIn(t *testing.T) {
-	id, user := credential(t, "Exact-pw-1", hashOf("$2a$10$placeholderplaceholderplaceholderplaceholderplacehol"))
+func bcryptOf(t *testing.T, plaintext string) *string {
+	t.Helper()
+	h, err := bcrypt.GenerateFromPassword([]byte(plaintext), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return hashOf(string(h))
+}
+
+// line is the transition line every successful login writes (models/tokenlogin.go). It ends in
+// a field after the id, so external_user=2 never matches external_user=20.
+func line(id int64, match, hashAccepts string) string {
+	return fmt.Sprintf("token login: external_user=%d app=base_api match=%s hash_accepts=%s", id, match, hashAccepts)
+}
+
+func TestAnExactPasswordWithAMatchingHashLogsInClean(t *testing.T) {
+	id, user := credential(t, "Exact-pw-1", bcryptOf(t, "Exact-pw-1"))
 	e := login(t, user, "Exact-pw-1")
 	if e.Success != 1 || e.Data == nil || e.Data.Token == "" {
 		t.Fatalf("an exact password: %+v", e)
 	}
-	if logged(t, fmt.Sprintf("collation-only match: external_user=%d", id)) {
-		t.Error("an exact match was logged as collation-only")
+	if !logged(t, line(id, "exact", "yes")) {
+		t.Error("a clean login did not write its positive line (silence must never read as safe)")
 	}
 }
 
 // (b), the TL's call: accepted as today, and logged, until the contract step.
 func TestACollationOnlyMatchIsAcceptedAndLogged(t *testing.T) {
 	for _, sent := range []string{"exact-pw-2", "EXACT-PW-2", "Exact-pw-2  ", "Exáct-pw-2"} {
-		id, user := credential(t, "Exact-pw-2", nil)
+		id, user := credential(t, "Exact-pw-2", bcryptOf(t, "Exact-pw-2"))
 		if e := login(t, user, sent); e.Success != 1 {
 			t.Errorf("%q against %q: refused (%q), want today's acceptance", sent, "Exact-pw-2", e.Message)
 			continue
 		}
-		if !logged(t, fmt.Sprintf("collation-only match: external_user=%d", id)) {
-			t.Errorf("%q: not logged as a collation-only match", sent)
+		// The hash is of the stored spelling, so it refuses the typed one: what the contract step would do.
+		if !logged(t, line(id, "collation", "no")) {
+			t.Errorf("%q: not logged as a collation-only match the hash would refuse", sent)
 		}
+	}
+}
+
+// Adversarial review: support changes a password by editing the plain text, so a hash made before
+// stays behind. That login must say the hash would refuse it.
+func TestAStaleHashIsLogged(t *testing.T) {
+	id, user := credential(t, "Changed-by-support", bcryptOf(t, "Old-pw"))
+	if e := login(t, user, "Changed-by-support"); e.Success != 1 {
+		t.Fatalf("the plain text must still decide: %+v", e)
+	}
+	if !logged(t, line(id, "exact", "no")) {
+		t.Error("a stale hash was not logged as one the hash would refuse")
+	}
+}
+
+func TestALoginWithoutAHashIsLogged(t *testing.T) {
+	id, user := credential(t, "No-hash-pw", nil)
+	login(t, user, "No-hash-pw")
+	if !logged(t, line(id, "exact", "absent")) {
+		t.Error("a login without a password_hash was not logged")
 	}
 }
 
@@ -150,38 +187,39 @@ func TestAWrongPasswordOrUsernameIsRefused(t *testing.T) {
 	}
 }
 
-// Notion 999, as in external-api: blanking the plain text disables a credential, whatever is sent.
+// Notion 999, as in external-api: blanking the plain text disables a credential, whatever is sent
+// (no field at all included). The refusal is logged, so it can't pass for a wrong password.
 func TestABlankedPlaintextLogsNothingIn(t *testing.T) {
 	for _, blank := range []string{"", "   "} {
-		_, user := credential(t, blank, nil)
+		id, user := credential(t, blank, nil)
 		for _, sent := range []string{"", " ", blank} {
 			if e := login(t, user, sent); e.Success != 0 {
 				t.Errorf("stored %q, sent %q: logged in", blank, sent)
 			}
 		}
+		if e := loginWithoutPassword(t, user); e.Success != 0 {
+			t.Errorf("stored %q, no password field: logged in", blank)
+		}
+		if !logged(t, fmt.Sprintf("token login refused: external_user=%d app=base_api: blanked plain text", id)) {
+			t.Errorf("stored %q: the refusal was not logged", blank)
+		}
 	}
 }
 
-func TestALoginWithoutAHashIsLogged(t *testing.T) {
-	without, user := credential(t, "No-hash-pw", nil)
-	login(t, user, "No-hash-pw")
-	if !logged(t, fmt.Sprintf("no password hash: external_user=%d", without)) {
-		t.Error("a login without a password_hash was not logged")
-	}
-	with, user2 := credential(t, "Hashed-pw", hashOf("$2a$10$placeholderplaceholderplaceholderplaceholderplacehol"))
-	login(t, user2, "Hashed-pw")
-	if logged(t, fmt.Sprintf("no password hash: external_user=%d", with)) {
-		t.Error("a credential with a hash was logged as having none")
-	}
-}
-
-// A database without schoolaid-admin's password_hash migration: the route works as before.
+// A database without schoolaid-admin's password_hash migration: the route works as before, and
+// says it can't tell, not a spurious read warning.
 func TestWithoutThePasswordHashColumn(t *testing.T) {
-	_, user := credential(t, "Old-schema-pw", nil)
+	id, user := credential(t, "Old-schema-pw", nil)
 	run(t, "ALTER TABLE external_user RENAME COLUMN password_hash TO password_hash_away")
 	defer run(t, "ALTER TABLE external_user RENAME COLUMN password_hash_away TO password_hash")
 	if e := login(t, user, "Old-schema-pw"); e.Success != 1 {
 		t.Errorf("without password_hash: %+v", e)
+	}
+	if !logged(t, line(id, "exact", "unknown")) {
+		t.Error("no transition line without the column")
+	}
+	if logged(t, fmt.Sprintf("password hash not read: external_user=%d ", id)) {
+		t.Error("a missing column was logged as a read failure (1054 not recognised)")
 	}
 }
 
@@ -193,6 +231,20 @@ func TestGetExternalUserDoesNotReadThePassword(t *testing.T) {
 	if _, err := models.GetExternalUser(fmt.Sprintf("db-token-%d", seq)); err != nil {
 		t.Errorf("GetExternalUser without the password column: %v", err)
 	}
+}
+
+func loginWithoutPassword(t *testing.T, username string) envelope {
+	t.Helper()
+	form := url.Values{"username": {username}}
+	r := httptest.NewRequest("POST", "/token", strings.NewReader(form.Encode()))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w := httptest.NewRecorder()
+	beego.BeeApp.Handlers.ServeHTTP(w, r)
+	var e envelope
+	if err := json.Unmarshal(w.Body.Bytes(), &e); err != nil {
+		t.Fatalf("POST /token: %d %q", w.Code, w.Body.String())
+	}
+	return e
 }
 
 func run(t *testing.T, q string) {

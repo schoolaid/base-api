@@ -7,7 +7,9 @@ import (
 
 	"github.com/beego/beego/v2/client/orm"
 	"github.com/beego/beego/v2/core/logs"
+	beego "github.com/beego/beego/v2/server/web"
 	"github.com/go-sql-driver/mysql"
+	"golang.org/x/crypto/bcrypt"
 )
 
 // MatchTokenLogin decides a POST /token login (Notion 999, PR 5's transition).
@@ -15,13 +17,19 @@ import (
 // ⚠️ THE PLAIN TEXT STILL DECIDES, compared by MySQL exactly as before (utf8mb3_general_ci:
 // case, trailing spaces and accents are ignored), as in external-api: support changes a password
 // by editing that column, and a hash of the old one must not keep it working. password_hash
-// decides only in the contract step, when the plain-text column goes. Until then two log lines
-// tell us when that is safe (counts per credential, never a value):
-//   - "collation-only match": MySQL accepted a password an exact compare would refuse;
-//   - "no password hash": a login succeeded for a credential without a password_hash.
+// decides only in the contract step, when the plain-text column goes.
+//
+// Until then every successful login writes ONE line, so the contract step can see, per credential
+// and per service, when the hash can decide alone (never a value; silence never means safe):
+//
+//	token login: external_user=<id> app=<appname> match=exact|collation hash_accepts=yes|no|absent|unknown
+//
+// match=collation: MySQL accepted what an exact compare refuses. hash_accepts is password_hash's
+// verdict on the SENT password (no: stale or collation-only; absent: none stored; unknown: no
+// password_hash column, or a failed read). A clean login (exact, yes) is Info, anything else Warn.
 //
 // ⚠️ A BLANKED PLAIN TEXT LOGS NOTHING IN (empty, or only spaces, which PAD SPACE compares equal
-// to the empty password): blanking the column disables a credential.
+// to the empty password): blanking the column disables a credential. The refusal is logged.
 //
 // ok is false for a wrong or unknown username or password; err is a failed read.
 func MatchTokenLogin(username, password string) (id int64, token string, ok bool, err error) {
@@ -34,30 +42,54 @@ func MatchTokenLogin(username, password string) (id int64, token string, ok bool
 	if _, err := o.Raw("SELECT id, token, password FROM external_user WHERE username = ? AND password = ?", username, password).QueryRows(&rows); err != nil {
 		return 0, "", false, err
 	}
-	if len(rows) != 1 || strings.TrimRight(rows[0].Password, " ") == "" {
+	if len(rows) != 1 {
 		return 0, "", false, nil
 	}
 	row := rows[0]
-	if subtle.ConstantTimeCompare([]byte(row.Password), []byte(password)) != 1 {
-		logs.Warn("token route: collation-only match: external_user=%d", row.Id)
+	app := appName()
+	if strings.TrimRight(row.Password, " ") == "" {
+		logs.Warn("token login refused: external_user=%d app=%s: blanked plain text", row.Id, app)
+		return 0, "", false, nil
 	}
-	if hashed, known := hasPasswordHash(o, row.Id); known && !hashed {
-		logs.Info("token route: no password hash: external_user=%d", row.Id)
+	match := "exact"
+	if subtle.ConstantTimeCompare([]byte(row.Password), []byte(password)) != 1 {
+		match = "collation"
+	}
+	hashAccepts := hashVerdict(o, row.Id, password, app)
+	line := "token login: external_user=%d app=%s match=%s hash_accepts=%s"
+	if match == "exact" && hashAccepts == "yes" {
+		logs.Info(line, row.Id, app, match, hashAccepts)
+	} else {
+		logs.Warn(line, row.Id, app, match, hashAccepts)
 	}
 	return row.Id, row.Token, true, nil
 }
 
-// hasPasswordHash reports whether the credential has a password_hash. known is false when it
-// can't tell: a database without schoolaid-admin's password_hash migration (1054), or a failed read.
-func hasPasswordHash(o orm.Ormer, id int64) (hashed, known bool) {
-	var n int
-	err := o.Raw("SELECT COUNT(*) FROM external_user WHERE id = ? AND password_hash IS NOT NULL AND password_hash <> ''", id).QueryRow(&n)
-	if err != nil {
+// hashVerdict is what password_hash would say about the sent password: "yes", "no", "absent"
+// (none stored) or "unknown" (no password_hash column: 1054; or a failed read, which logs).
+func hashVerdict(o orm.Ormer, id int64, password, app string) string {
+	var hashes []*string
+	if _, err := o.Raw("SELECT password_hash FROM external_user WHERE id = ?", id).QueryRows(&hashes); err != nil {
 		var me *mysql.MySQLError
 		if !errors.As(err, &me) || me.Number != 1054 {
-			logs.Warn("token route: password hash not read: external_user=%d: %v", id, err)
+			logs.Warn("token login: password hash not read: external_user=%d app=%s: %v", id, app, err)
 		}
-		return false, false
+		return "unknown"
 	}
-	return n == 1, true
+	if len(hashes) != 1 || hashes[0] == nil || *hashes[0] == "" {
+		return "absent"
+	}
+	if bcrypt.CompareHashAndPassword([]byte(*hashes[0]), []byte(password)) != nil {
+		return "no"
+	}
+	return "yes"
+}
+
+// appName names the service in the transition line (each of positions-api, schoolaid-api and
+// menu-api imports this route), so the window can be checked per service.
+func appName() string {
+	if name, err := beego.AppConfig.String("appname"); err == nil && name != "" {
+		return name
+	}
+	return "unknown"
 }
