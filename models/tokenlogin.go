@@ -1,9 +1,12 @@
 package models
 
 import (
+	"crypto/sha256"
 	"crypto/subtle"
 	"errors"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/beego/beego/v2/client/orm"
 	"github.com/beego/beego/v2/core/logs"
@@ -55,7 +58,7 @@ func MatchTokenLogin(username, password string) (id int64, token string, ok bool
 	if subtle.ConstantTimeCompare([]byte(row.Password), []byte(password)) != 1 {
 		match = "collation"
 	}
-	hashAccepts := hashVerdict(o, row.Id, password, app)
+	hashAccepts := hashVerdict(o, row.Id, password, match == "exact", app)
 	line := "token login: external_user=%d app=%s match=%s hash_accepts=%s"
 	if match == "exact" && hashAccepts == "yes" {
 		logs.Info(line, row.Id, app, match, hashAccepts)
@@ -67,7 +70,12 @@ func MatchTokenLogin(username, password string) (id int64, token string, ok bool
 
 // hashVerdict is what password_hash would say about the sent password: "yes", "no", "absent"
 // (none stored) or "unknown" (no password_hash column: 1054; or a failed read, which logs).
-func hashVerdict(o orm.Ormer, id int64, password, app string) string {
+//
+// bcrypt (~50ms of CPU) runs only for an exact spelling, at most once per credential and stored
+// hash (the verdict is remembered): the services importing this route may have no login limiter.
+// A collation-only spelling can never match a hash of the stored spelling, and the collation
+// accepts an unbounded set of them, so it is "no" with no bcrypt. One entry per credential.
+func hashVerdict(o orm.Ormer, id int64, password string, exact bool, app string) string {
 	var hashes []*string
 	if _, err := o.Raw("SELECT password_hash FROM external_user WHERE id = ?", id).QueryRows(&hashes); err != nil {
 		var me *mysql.MySQLError
@@ -79,10 +87,40 @@ func hashVerdict(o orm.Ormer, id int64, password, app string) string {
 	if len(hashes) != 1 || hashes[0] == nil || *hashes[0] == "" {
 		return "absent"
 	}
-	if bcrypt.CompareHashAndPassword([]byte(*hashes[0]), []byte(password)) != nil {
+	if !exact {
 		return "no"
 	}
-	return "yes"
+	hash := *hashes[0]
+	fp := sha256.Sum256(append(append([]byte(password), 0), hash...))
+	if v, ok := verdicts.Load(id); ok && v.(rememberedVerdict).fingerprint == fp {
+		return v.(rememberedVerdict).verdict
+	}
+	runs, _ := bcryptRuns.LoadOrStore(id, new(int64))
+	atomic.AddInt64(runs.(*int64), 1)
+	verdict := "yes"
+	if bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) != nil {
+		verdict = "no"
+	}
+	verdicts.Store(id, rememberedVerdict{fingerprint: fp, verdict: verdict})
+	return verdict
+}
+
+type rememberedVerdict struct {
+	fingerprint [32]byte
+	verdict     string
+}
+
+var (
+	verdicts   sync.Map // int64 -> rememberedVerdict
+	bcryptRuns sync.Map // int64 -> *int64 (tests)
+)
+
+// TransitionBcryptRunsForTest is how many times the verdict ran bcrypt for a credential.
+func TransitionBcryptRunsForTest(id int64) int64 {
+	if runs, ok := bcryptRuns.Load(id); ok {
+		return atomic.LoadInt64(runs.(*int64))
+	}
+	return 0
 }
 
 // appName names the service in the transition line (each of positions-api, schoolaid-api and

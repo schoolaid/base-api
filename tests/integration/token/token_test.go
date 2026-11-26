@@ -247,9 +247,55 @@ func loginWithoutPassword(t *testing.T, username string) envelope {
 	return e
 }
 
-func run(t *testing.T, q string) {
+func run(t *testing.T, q string, args ...interface{}) {
 	t.Helper()
-	if _, err := orm.NewOrm().Raw(q).Exec(); err != nil {
+	if _, err := orm.NewOrm().Raw(q, args...).Exec(); err != nil {
 		t.Fatal(q, err)
+	}
+}
+
+// qa-1: bcrypt (~50ms of CPU) runs only for an exact spelling, at most once per credential and
+// stored hash: the services importing this route have no login limiter of their own. A
+// collation-only spelling can't match a hash of the stored spelling, so it needs no bcrypt.
+func TestBcryptRunsOncePerCredentialAndHash(t *testing.T) {
+	id, user := credential(t, "Loop-pw", bcryptOf(t, "Loop-pw"))
+	for i := 0; i < 3; i++ {
+		login(t, user, "Loop-pw")
+	}
+	for i := 1; i <= 4; i++ {
+		login(t, user, "LOOP-PW"+strings.Repeat(" ", i))
+	}
+	if n := models.TransitionBcryptRunsForTest(id); n != 1 {
+		t.Errorf("bcrypt ran %d times for 3 exact + 4 collation logins, want 1", n)
+	}
+	if !logged(t, line(id, "collation", "no")) {
+		t.Error("the collation logins lost their verdict")
+	}
+	// A new stored hash (support set a new password) is a new verdict.
+	run(t, "UPDATE external_user SET password_hash = ? WHERE id = ?", *bcryptOf(t, "Other-pw"), id)
+	login(t, user, "Loop-pw")
+	if n := models.TransitionBcryptRunsForTest(id); n != 2 {
+		t.Errorf("after a new hash, bcrypt ran %d times in all, want 2", n)
+	}
+}
+
+// qa-1: no secret material in any token-route line: not the sent password, not the stored plain
+// text, not the hash.
+func TestNoSecretMaterialInTheLog(t *testing.T) {
+	stored, sent := "Secret-Stored-Pw-9", "SECRET-STORED-PW-9 "
+	hash := bcryptOf(t, stored)
+	_, user := credential(t, stored, hash)
+	login(t, user, stored)
+	login(t, user, sent)
+	login(t, user, "Wrong-Secret-9")
+	blankId, blankUser := credential(t, "   ", nil)
+	_ = blankId
+	login(t, blankUser, "Blank-Secret-9")
+	logs.GetBeeLogger().Flush()
+	b, _ := os.ReadFile(logFile)
+	for _, secret := range []string{stored, strings.TrimSpace(sent), "Wrong-Secret-9", "Blank-Secret-9", *hash, (*hash)[7:29]} {
+		if strings.Contains(strings.ToLower(string(b)), strings.ToLower(secret)) {
+			t.Errorf("the log holds secret material (%d chars)", len(secret))
+		}
 	}
 }
