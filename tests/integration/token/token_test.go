@@ -299,3 +299,21 @@ func TestNoSecretMaterialInTheLog(t *testing.T) {
 		}
 	}
 }
+
+// qa-1 C4: the cached verdict is keyed by the sent password too, not the hash alone. Support edits
+// the plain text and leaves the hash; the new exact password must be judged against that hash
+// again (stale: "no"), not served the old password's cached "yes".
+func TestTheCacheIsKeyedByTheSentPasswordToo(t *testing.T) {
+	id, user := credential(t, "First-pw-c4", bcryptOf(t, "First-pw-c4"))
+	login(t, user, "First-pw-c4")
+	if !logged(t, line(id, "exact", "yes")) {
+		t.Fatal("the first login's verdict")
+	}
+	run(t, "UPDATE external_user SET password = ? WHERE id = ?", "Second-pw-c4", id)
+	if e := login(t, user, "Second-pw-c4"); e.Success != 1 {
+		t.Fatalf("the plain text must still decide: %+v", e)
+	}
+	if !logged(t, line(id, "exact", "no")) {
+		t.Error("the edited password got the old password's cached verdict")
+	}
+}
