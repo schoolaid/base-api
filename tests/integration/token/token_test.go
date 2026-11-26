@@ -299,3 +299,75 @@ func TestNoSecretMaterialInTheLog(t *testing.T) {
 		}
 	}
 }
+
+// loginFrom is a login whose request carries this X-Forwarded-For (as the load balancer passes
+// it on) and comes from this peer address.
+func loginFrom(t *testing.T, username, password, xff, remote string) envelope {
+	t.Helper()
+	form := url.Values{"username": {username}, "password": {password}}
+	r := httptest.NewRequest("POST", "/token", strings.NewReader(form.Encode()))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if xff != "" {
+		r.Header.Set("X-Forwarded-For", xff)
+	}
+	r.RemoteAddr = remote
+	w := httptest.NewRecorder()
+	beego.BeeApp.Handlers.ServeHTTP(w, r)
+	var e envelope
+	if err := json.Unmarshal(w.Body.Bytes(), &e); err != nil {
+		t.Fatalf("POST /token: %d %q", w.Code, w.Body.String())
+	}
+	return e
+}
+
+// Where a login came from, classified, never logged raw: a known source by its configured label
+// (TOKEN_LOGIN_KNOWN_SOURCES, label=IP-or-CIDR pairs), else "vpc" for a private address, else
+// "external" ("unknown" if it doesn't parse). Only the rightmost X-Forwarded-For hop counts (the
+// one the load balancer appends); anything the client put before it is ignored. With no header,
+// the peer address.
+func TestTheLoginLineSaysWhereItCameFrom(t *testing.T) {
+	t.Setenv("TOKEN_LOGIN_KNOWN_SOURCES", "nat=198.51.100.7,old-box=203.0.113.0/29")
+	models.ResetTokenSourcesForTest()
+	defer models.ResetTokenSourcesForTest()
+	for _, c := range []struct {
+		name, xff, remote, want string
+	}{
+		{"through the load balancer from our NAT", "198.51.100.7", "10.0.3.4:4431", "nat"},
+		{"from a known host in a range", "203.0.113.5", "10.0.3.4:4431", "old-box"},
+		{"from outside", "192.0.2.44", "10.0.3.4:4431", "external"},
+		{"a client-supplied hop is ignored", "198.51.100.7, 192.0.2.44", "10.0.3.4:4431", "external"},
+		{"in the cluster, no load balancer", "", "10.0.9.8:5512", "vpc"},
+		{"a bad hop", "not-an-ip", "10.0.3.4:4431", "unknown"},
+	} {
+		id, user := credential(t, "From-pw", bcryptOf(t, "From-pw"))
+		if e := loginFrom(t, user, "From-pw", c.xff, c.remote); e.Success != 1 {
+			t.Fatalf("%s: %+v", c.name, e)
+		}
+		if !logged(t, line(id, "exact", "yes")+" from="+c.want+"\n") {
+			t.Errorf("%s: no line with from=%s", c.name, c.want)
+		}
+	}
+	logs.GetBeeLogger().Flush()
+	b, _ := os.ReadFile(logFile)
+	for _, raw := range []string{"198.51.100.7", "203.0.113.5", "192.0.2.44", "10.0.9.8", "10.0.3.4"} {
+		if strings.Contains(string(b), raw) {
+			t.Errorf("a raw address reached the log (%d chars)", len(raw))
+		}
+	}
+}
+
+func TestAMalformedKnownSourceIsIgnored(t *testing.T) {
+	t.Setenv("TOKEN_LOGIN_KNOWN_SOURCES", "good=198.51.100.9,BAD LABEL=198.51.100.10,nolabel,x=not-an-ip")
+	models.ResetTokenSourcesForTest()
+	defer models.ResetTokenSourcesForTest()
+	id, user := credential(t, "Malformed-pw", bcryptOf(t, "Malformed-pw"))
+	loginFrom(t, user, "Malformed-pw", "198.51.100.10", "10.0.3.4:4431")
+	if !logged(t, line(id, "exact", "yes")+" from=external\n") {
+		t.Error("an entry with a bad label was used")
+	}
+	id2, user2 := credential(t, "Malformed-pw-2", bcryptOf(t, "Malformed-pw-2"))
+	loginFrom(t, user2, "Malformed-pw-2", "198.51.100.9", "10.0.3.4:4431")
+	if !logged(t, line(id2, "exact", "yes")+" from=good\n") {
+		t.Error("a good entry next to bad ones was dropped")
+	}
+}

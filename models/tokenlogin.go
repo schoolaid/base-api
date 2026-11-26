@@ -25,7 +25,10 @@ import (
 // Until then every successful login writes ONE line, so the contract step can see, per credential
 // and per service, when the hash can decide alone (never a value; silence never means safe):
 //
-//	token login: external_user=<id> app=<appname> match=exact|collation hash_accepts=yes|no|absent|unknown
+//	token login: external_user=<id> app=<appname> match=exact|collation hash_accepts=yes|no|absent|unknown from=<source>
+//
+// from= is ClassifyTokenSource's label (a configured source, vpc, external or unknown), never an
+// address.
 //
 // match=collation: MySQL accepted what an exact compare refuses. hash_accepts is password_hash's
 // verdict on the SENT password (no: stale or collation-only; absent: none stored; unknown: no
@@ -35,7 +38,7 @@ import (
 // to the empty password): blanking the column disables a credential. The refusal is logged.
 //
 // ok is false for a wrong or unknown username or password; err is a failed read.
-func MatchTokenLogin(username, password string) (id int64, token string, ok bool, err error) {
+func MatchTokenLogin(username, password, from string) (id int64, token string, ok bool, err error) {
 	var rows []struct {
 		Id       int64
 		Token    string
@@ -59,11 +62,11 @@ func MatchTokenLogin(username, password string) (id int64, token string, ok bool
 		match = "collation"
 	}
 	hashAccepts := hashVerdict(o, row.Id, password, match == "exact", app)
-	line := "token login: external_user=%d app=%s match=%s hash_accepts=%s"
+	line := "token login: external_user=%d app=%s match=%s hash_accepts=%s from=%s"
 	if match == "exact" && hashAccepts == "yes" {
-		logs.Info(line, row.Id, app, match, hashAccepts)
+		logs.Info(line, row.Id, app, match, hashAccepts, from)
 	} else {
-		logs.Warn(line, row.Id, app, match, hashAccepts)
+		logs.Warn(line, row.Id, app, match, hashAccepts, from)
 	}
 	return row.Id, row.Token, true, nil
 }
