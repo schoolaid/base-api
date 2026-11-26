@@ -19,7 +19,8 @@ func (c *AuthController) Post() {
     password := c.GetString("password");
 
     // The plain text still decides during PR 5's transition (models/tokenlogin.go).
-    _, dbToken, ok, err := models.MatchTokenLogin(username, password, models.ClassifyTokenSource(c.Ctx.Request))
+    claimedUser, _ := c.GetInt64("user_id")
+    _, dbToken, ok, err := models.MatchTokenLogin(username, password, models.ClassifyTokenSource(c.Ctx.Request), models.TokenSourceTag(c.Ctx.Request), claimedUser)
 
     response := &app.AuthResponse {
         Success: 0,

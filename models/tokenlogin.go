@@ -25,10 +25,11 @@ import (
 // Until then every successful login writes ONE line, so the contract step can see, per credential
 // and per service, when the hash can decide alone (never a value; silence never means safe):
 //
-//	token login: external_user=<id> app=<appname> match=exact|collation hash_accepts=yes|no|absent|unknown from=<source>
+//	token login: external_user=<id> app=<appname> match=exact|collation hash_accepts=yes|no|absent|unknown from=<source> user=<claimed id> src=<tag>
 //
 // from= is ClassifyTokenSource's label (a configured source, vpc, external or unknown), never an
-// address.
+// address. user= is the user_id the caller claimed (0 if none or not a number). src= is
+// TokenSourceTag's keyed tag of the address (or unkeyed / unknown), never the address.
 //
 // match=collation: MySQL accepted what an exact compare refuses. hash_accepts is password_hash's
 // verdict on the SENT password (no: stale or collation-only; absent: none stored; unknown: no
@@ -38,7 +39,7 @@ import (
 // to the empty password): blanking the column disables a credential. The refusal is logged.
 //
 // ok is false for a wrong or unknown username or password; err is a failed read.
-func MatchTokenLogin(username, password, from string) (id int64, token string, ok bool, err error) {
+func MatchTokenLogin(username, password, from, src string, claimedUser int64) (id int64, token string, ok bool, err error) {
 	var rows []struct {
 		Id       int64
 		Token    string
@@ -62,11 +63,11 @@ func MatchTokenLogin(username, password, from string) (id int64, token string, o
 		match = "collation"
 	}
 	hashAccepts := hashVerdict(o, row.Id, password, match == "exact", app)
-	line := "token login: external_user=%d app=%s match=%s hash_accepts=%s from=%s"
+	line := "token login: external_user=%d app=%s match=%s hash_accepts=%s from=%s user=%d src=%s"
 	if match == "exact" && hashAccepts == "yes" {
-		logs.Info(line, row.Id, app, match, hashAccepts, from)
+		logs.Info(line, row.Id, app, match, hashAccepts, from, claimedUser, src)
 	} else {
-		logs.Warn(line, row.Id, app, match, hashAccepts, from)
+		logs.Warn(line, row.Id, app, match, hashAccepts, from, claimedUser, src)
 	}
 	return row.Id, row.Token, true, nil
 }

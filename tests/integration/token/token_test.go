@@ -13,6 +13,9 @@
 package token
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http/httptest"
@@ -343,7 +346,7 @@ func TestTheLoginLineSaysWhereItCameFrom(t *testing.T) {
 		if e := loginFrom(t, user, "From-pw", c.xff, c.remote); e.Success != 1 {
 			t.Fatalf("%s: %+v", c.name, e)
 		}
-		if !logged(t, line(id, "exact", "yes")+" from="+c.want+"\n") {
+		if !logged(t, line(id, "exact", "yes")+" from="+c.want+" user=") {
 			t.Errorf("%s: no line with from=%s", c.name, c.want)
 		}
 	}
@@ -362,12 +365,12 @@ func TestAMalformedKnownSourceIsIgnored(t *testing.T) {
 	defer models.ResetTokenSourcesForTest()
 	id, user := credential(t, "Malformed-pw", bcryptOf(t, "Malformed-pw"))
 	loginFrom(t, user, "Malformed-pw", "198.51.100.10", "10.0.3.4:4431")
-	if !logged(t, line(id, "exact", "yes")+" from=external\n") {
+	if !logged(t, line(id, "exact", "yes")+" from=external user=") {
 		t.Error("an entry with a bad label was used")
 	}
 	id2, user2 := credential(t, "Malformed-pw-2", bcryptOf(t, "Malformed-pw-2"))
 	loginFrom(t, user2, "Malformed-pw-2", "198.51.100.9", "10.0.3.4:4431")
-	if !logged(t, line(id2, "exact", "yes")+" from=good\n") {
+	if !logged(t, line(id2, "exact", "yes")+" from=good user=") {
 		t.Error("a good entry next to bad ones was dropped")
 	}
 }
@@ -387,7 +390,7 @@ func TestTwoForwardedForLinesUseTheLastLinesRightmostHop(t *testing.T) {
 	r.RemoteAddr = "10.0.3.4:4431"
 	w := httptest.NewRecorder()
 	beego.BeeApp.Handlers.ServeHTTP(w, r)
-	if !logged(t, line(id, "exact", "yes")+" from=external\n") {
+	if !logged(t, line(id, "exact", "yes")+" from=external user=") {
 		t.Error("the first X-Forwarded-For line (client-controlled) decided the source")
 	}
 }
@@ -400,12 +403,12 @@ func TestKnownSourcesTrimSpacesAndLogWhatTheyIgnore(t *testing.T) {
 	defer models.ResetTokenSourcesForTest()
 	id, user := credential(t, "Trim-pw", bcryptOf(t, "Trim-pw"))
 	loginFrom(t, user, "Trim-pw", "198.51.100.7", "10.0.3.4:4431")
-	if !logged(t, line(id, "exact", "yes")+" from=nat\n") {
+	if !logged(t, line(id, "exact", "yes")+" from=nat user=") {
 		t.Error("a source with spaces around = was dropped")
 	}
 	id2, user2 := credential(t, "Trim-pw-2", bcryptOf(t, "Trim-pw-2"))
 	loginFrom(t, user2, "Trim-pw-2", "203.0.113.5", "10.0.3.4:4431")
-	if !logged(t, line(id2, "exact", "yes")+" from=old-box\n") {
+	if !logged(t, line(id2, "exact", "yes")+" from=old-box user=") {
 		t.Error("a source with a space after = was dropped")
 	}
 	for _, i := range []string{"3", "4"} {
@@ -419,5 +422,90 @@ func TestKnownSourcesTrimSpacesAndLogWhatTheyIgnore(t *testing.T) {
 		if strings.Contains(string(b), v) {
 			t.Errorf("an ignored entry's value reached the log (%d chars)", len(v))
 		}
+	}
+}
+
+// loginAs is a login that sends this user_id form field (as the apps do), from this
+// X-Forwarded-For and peer.
+func loginAs(t *testing.T, username, password, userID, xff, remote string) {
+	t.Helper()
+	form := url.Values{"username": {username}, "password": {password}}
+	if userID != "" {
+		form.Set("user_id", userID)
+	}
+	r := httptest.NewRequest("POST", "/token", strings.NewReader(form.Encode()))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if xff != "" {
+		r.Header.Set("X-Forwarded-For", xff)
+	}
+	r.RemoteAddr = remote
+	beego.BeeApp.Handlers.ServeHTTP(httptest.NewRecorder(), r)
+}
+
+const srcTestKey = "src-tag-test-key-0123456789abcdef"
+
+func srcTag(addr string) string {
+	m := hmac.New(sha256.New, []byte(srcTestKey))
+	m.Write([]byte(addr))
+	return hex.EncodeToString(m.Sum(nil))[:8]
+}
+
+// The line carries the user_id the caller claimed (the apps send it) and a keyed tag of the
+// address the load balancer saw, so an hour of lines shows how many users one source mints. Never
+// the address itself.
+func TestTheLoginLineCarriesTheClaimedUserAndAKeyedSource(t *testing.T) {
+	t.Setenv("TOKEN_LOGIN_SRC_KEY", srcTestKey)
+	models.ResetTokenSourcesForTest()
+	defer models.ResetTokenSourcesForTest()
+	for _, c := range []struct {
+		name, userID, xff, remote, want string
+	}{
+		{"the apps' user", "42", "198.51.100.7", "10.0.3.4:4431", " user=42 src=" + srcTag("198.51.100.7") + "\n"},
+		{"no user_id", "", "198.51.100.7", "10.0.3.4:4431", " user=0 src=" + srcTag("198.51.100.7") + "\n"},
+		{"a non-numeric user_id", "abc", "198.51.100.7", "10.0.3.4:4431", " user=0 src=" + srcTag("198.51.100.7") + "\n"},
+		{"a client-supplied hop is ignored", "7", "203.0.113.99, 198.51.100.8", "10.0.3.4:4431", " user=7 src=" + srcTag("198.51.100.8") + "\n"},
+		{"no load balancer: the peer", "7", "", "10.0.9.8:5512", " user=7 src=" + srcTag("10.0.9.8") + "\n"},
+		{"a mapped IPv4 tags as the IPv4", "7", "::ffff:198.51.100.7", "10.0.3.4:4431", " user=7 src=" + srcTag("198.51.100.7") + "\n"},
+		{"an unparseable hop", "7", "not-an-ip", "10.0.3.4:4431", " user=7 src=unknown\n"},
+	} {
+		id, user := credential(t, "Src-pw", bcryptOf(t, "Src-pw"))
+		loginAs(t, user, "Src-pw", c.userID, c.xff, c.remote)
+		if !logged(t, line(id, "exact", "yes")+" from=") || !logged(t, c.want) {
+			t.Errorf("%s: no line ending %q", c.name, strings.TrimSpace(c.want))
+		}
+	}
+	logs.GetBeeLogger().Flush()
+	b, _ := os.ReadFile(logFile)
+	for _, raw := range []string{"198.51.100.7", "198.51.100.8", "203.0.113.99", "10.0.9.8"} {
+		if strings.Contains(string(b), raw) {
+			t.Errorf("a raw address reached the log (%d chars)", len(raw))
+		}
+	}
+}
+
+// No key, or one too short to be a key: src=unkeyed, never the address and never a hash anyone
+// could recompute from a list of addresses.
+func TestWithoutAUsableKeyTheSourceIsUnkeyed(t *testing.T) {
+	for _, key := range []string{"", "   ", "short-key"} {
+		t.Setenv("TOKEN_LOGIN_SRC_KEY", key)
+		models.ResetTokenSourcesForTest()
+		id, user := credential(t, "Unkeyed-pw", bcryptOf(t, "Unkeyed-pw"))
+		loginAs(t, user, "Unkeyed-pw", "5", "198.51.100.9", "10.0.3.4:4431")
+		if !logged(t, line(id, "exact", "yes")+" from=external user=5 src=unkeyed\n") {
+			t.Errorf("key %q (%d chars): src was not unkeyed", key, len(key))
+		}
+	}
+	models.ResetTokenSourcesForTest()
+}
+
+// A refused login logs nothing new: the line is for minted tokens.
+func TestARefusedLoginCarriesNoUserLine(t *testing.T) {
+	t.Setenv("TOKEN_LOGIN_SRC_KEY", srcTestKey)
+	models.ResetTokenSourcesForTest()
+	defer models.ResetTokenSourcesForTest()
+	_, user := credential(t, "Right-pw", bcryptOf(t, "Right-pw"))
+	loginAs(t, user, "Wrong-pw", "9191", "198.51.100.7", "10.0.3.4:4431")
+	if logged(t, " user=9191 ") {
+		t.Error("a refused login logged a claimed user")
 	}
 }
